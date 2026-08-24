@@ -476,6 +476,17 @@
 <script src="./config.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
+
+<script>
+// BudgetPro PWA: register one service worker for GitHub Pages.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('./service-worker.js', {scope: './'})
+      .then(function () { console.log('BudgetPro app ready'); })
+      .catch(function (err) { console.warn('BudgetPro service worker:', err); });
+  });
+}
+</script>
 </head>
 <body class="h-screen flex overflow-hidden">
 
@@ -4571,27 +4582,6 @@
             }
         };
     </script>
-    <script>
-        if ("serviceWorker" in navigator) {
-            window.addEventListener("load", () => {
-                navigator.serviceWorker.register("./service-worker.js")
-                    .then(() => console.log("BudgetPro offline mode enabled"))
-                    .catch(error => console.error("BudgetPro service worker error:", error));
-            });
-        }
-    </script>
-
-<script>
-(function(){
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', function() {
-      navigator.serviceWorker.register('./sw.js').catch(function(err) {
-        console.warn('BudgetPro service worker:', err);
-      });
-    });
-  }
-})();
-</script>
 
 
 <div id="bp-cloud-panel" style="position:fixed;right:18px;bottom:18px;z-index:99999;font-family:inherit;">
