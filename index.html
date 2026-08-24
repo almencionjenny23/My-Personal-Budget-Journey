@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>BudgetPro & Debt Manager</title>
     <link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#f9a8c5">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="BudgetPro">
     <meta name="theme-color" content="#f9a8c5">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -468,6 +472,10 @@
             to { transform: translateY(0); opacity: 1; }
         }
     </style>
+
+<script src="./config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
 </head>
 <body class="h-screen flex overflow-hidden">
 
@@ -4572,5 +4580,290 @@
             });
         }
     </script>
+
+<script>
+(function(){
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function() {
+      navigator.serviceWorker.register('./sw.js').catch(function(err) {
+        console.warn('BudgetPro service worker:', err);
+      });
+    });
+  }
+})();
+</script>
+
+
+<div id="bp-cloud-panel" style="position:fixed;right:18px;bottom:18px;z-index:99999;font-family:inherit;">
+  <button id="bp-cloud-button" type="button"
+    style="border:0;border-radius:999px;padding:11px 16px;background:#f9a8c5;color:#fff;font-weight:800;box-shadow:0 8px 24px rgba(0,0,0,.15);cursor:pointer;">
+    ☁️ Cloud Sync
+  </button>
+  <div id="bp-cloud-modal" style="display:none;position:absolute;right:0;bottom:54px;width:330px;background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.2);color:#334155;">
+    <div style="font-weight:900;font-size:17px;margin-bottom:4px;">BudgetPro Cloud Sync</div>
+    <div id="bp-cloud-status" style="font-size:12px;color:#64748b;margin-bottom:14px;">Not signed in</div>
+    <input id="bp-cloud-email" type="email" placeholder="Email"
+      style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;margin-bottom:8px;">
+    <input id="bp-cloud-password" type="password" placeholder="Password (6+ characters)"
+      style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;margin-bottom:10px;">
+    <div style="display:flex;gap:8px;">
+      <button id="bp-cloud-signup" type="button" style="flex:1;border:0;border-radius:10px;padding:10px;background:#fce7f3;font-weight:800;cursor:pointer;">Create account</button>
+      <button id="bp-cloud-login" type="button" style="flex:1;border:0;border-radius:10px;padding:10px;background:#f9a8c5;color:#fff;font-weight:800;cursor:pointer;">Log in</button>
+    </div>
+    <button id="bp-cloud-logout" type="button" style="display:none;width:100%;margin-top:8px;border:0;border-radius:10px;padding:10px;background:#f1f5f9;font-weight:800;cursor:pointer;">Log out</button>
+    <div id="bp-cloud-message" style="font-size:11px;margin-top:10px;line-height:1.4;"></div>
+  </div>
+</div>
+
 </body>
+
+
+<script>
+(function () {
+  const cfg = window.BUDGETPRO_SUPABASE || {};
+  const SUPABASE_URL = cfg.url;
+  const SUPABASE_KEY = cfg.anonKey;
+
+  if (!window.supabase || !SUPABASE_URL || !SUPABASE_KEY ||
+      SUPABASE_URL.includes("PASTE_") || SUPABASE_KEY.includes("PASTE_")) {
+    console.warn("BudgetPro: Supabase configuration is missing.");
+    return;
+  }
+
+  const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  window.supabaseClient = sb;
+  let saveTimer = null;
+  let realtimeChannel = null;
+  let applyingRemote = false;
+
+  const $ = id => document.getElementById(id);
+  const modal = $("bp-cloud-modal");
+  const status = $("bp-cloud-status");
+  const message = $("bp-cloud-message");
+
+  $("bp-cloud-button").onclick = () => {
+    modal.style.display = modal.style.display === "none" ? "block" : "none";
+  };
+
+  function setMessage(text, good) {
+    message.textContent = text || "";
+    message.style.color = good ? "#059669" : "#dc2626";
+  }
+
+  function setStatus(text) {
+    status.textContent = text;
+  }
+
+  function collectState() {
+    const data = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("bp_") && ![
+        "bp_cloud_last_sync",
+        "bp_device_id",
+        "bp_supabase_config"
+      ].includes(k)) {
+        data[k] = localStorage.getItem(k);
+      }
+    }
+    return data;
+  }
+
+  function restoreState(data) {
+    if (!data) return;
+    applyingRemote = true;
+    Object.entries(data).forEach(([k, v]) => {
+      if (k.startsWith("bp_")) localStorage.setItem(k, v);
+    });
+    applyingRemote = false;
+  }
+
+  async function getUser() {
+    const { data } = await sb.auth.getSession();
+    return data?.session?.user || null;
+  }
+
+  async function pushCloud() {
+    if (applyingRemote) return;
+    const user = await getUser();
+    if (!user) {
+      setStatus("Saved on this device");
+      return;
+    }
+
+    setStatus("Saving to cloud…");
+    const payload = {
+      user_id: user.id,
+      data: collectState(),
+      updated_at: new Date().toISOString()
+    };
+
+    const { error } = await sb
+      .from("budgetpro_data")
+      .upsert(payload, { onConflict: "user_id" });
+
+    if (error) {
+      console.error(error);
+      setStatus("Cloud save error");
+      setMessage(error.message, false);
+      return;
+    }
+
+    localStorage.setItem("bp_cloud_last_sync", payload.updated_at);
+    setStatus("✓ Synced to cloud");
+  }
+
+  function scheduleCloudSave() {
+    if (applyingRemote) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => pushCloud().catch(console.error), 700);
+  }
+
+  async function pullCloud() {
+    const user = await getUser();
+    if (!user) return;
+
+    const { data, error } = await sb
+      .from("budgetpro_data")
+      .select("data,updated_at")
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    if (error) {
+      console.error(error);
+      setMessage(error.message, false);
+      return;
+    }
+
+    if (!data) {
+      // First login on this account: upload the current local BudgetPro.
+      await pushCloud();
+      return;
+    }
+
+    const remoteTime = new Date(data.updated_at || 0).getTime();
+    const localTime = new Date(localStorage.getItem("bp_cloud_last_sync") || 0).getTime();
+
+    if (remoteTime >= localTime) {
+      restoreState(data.data);
+      localStorage.setItem("bp_cloud_last_sync", data.updated_at);
+      setStatus("✓ Cloud data loaded");
+      if (typeof renderAll === "function") renderAll();
+      const savedTab = ["dashboard","transactions","savings","debt","borrowers"].includes(state.activeTab)
+        ? state.activeTab : "dashboard";
+      if (typeof switchTab === "function") switchTab(savedTab);
+    }
+  }
+
+  function subscribeRealtime(user) {
+    if (realtimeChannel) sb.removeChannel(realtimeChannel);
+
+    realtimeChannel = sb.channel("budgetpro-sync-" + user.id)
+      .on("postgres_changes", {
+        event: "*",
+        schema: "public",
+        table: "budgetpro_data",
+        filter: "user_id=eq." + user.id
+      }, async payload => {
+        if (applyingRemote) return;
+        const row = payload.new;
+        if (!row || !row.data) return;
+
+        const remoteTime = new Date(row.updated_at || 0).getTime();
+        const localTime = new Date(localStorage.getItem("bp_cloud_last_sync") || 0).getTime();
+
+        if (remoteTime > localTime) {
+          restoreState(row.data);
+          localStorage.setItem("bp_cloud_last_sync", row.updated_at);
+          setStatus("✓ Updated from another device");
+          if (typeof renderAll === "function") renderAll();
+          const savedTab = ["dashboard","transactions","savings","debt","borrowers"].includes(state.activeTab)
+            ? state.activeTab : "dashboard";
+          if (typeof switchTab === "function") switchTab(savedTab);
+        }
+      })
+      .subscribe();
+  }
+
+  async function updateAuthUI() {
+    const user = await getUser();
+    $("bp-cloud-email").style.display = user ? "none" : "block";
+    $("bp-cloud-password").style.display = user ? "none" : "block";
+    $("bp-cloud-signup").style.display = user ? "none" : "block";
+    $("bp-cloud-login").style.display = user ? "none" : "block";
+    $("bp-cloud-logout").style.display = user ? "block" : "none";
+
+    if (user) {
+      setStatus("Signed in: " + (user.email || "Account"));
+      subscribeRealtime(user);
+    } else {
+      setStatus("Not signed in — local saving still works");
+    }
+  }
+
+  $("bp-cloud-signup").onclick = async () => {
+    const email = $("bp-cloud-email").value.trim();
+    const password = $("bp-cloud-password").value;
+    if (!email || password.length < 6) {
+      setMessage("Enter an email and a password with at least 6 characters.", false);
+      return;
+    }
+    const { error } = await sb.auth.signUp({ email, password });
+    if (error) {
+      setMessage(error.message, false);
+      return;
+    }
+    setMessage("Account created. If email confirmation is enabled, check your email, then log in.", true);
+  };
+
+  $("bp-cloud-login").onclick = async () => {
+    const email = $("bp-cloud-email").value.trim();
+    const password = $("bp-cloud-password").value;
+    const { error } = await sb.auth.signInWithPassword({ email, password });
+    if (error) {
+      setMessage(error.message, false);
+      return;
+    }
+    setMessage("Logged in successfully.", true);
+    await updateAuthUI();
+    await pullCloud();
+  };
+
+  $("bp-cloud-logout").onclick = async () => {
+    await sb.auth.signOut();
+    setMessage("Logged out. Your data remains saved on this device.", true);
+    await updateAuthUI();
+  };
+
+  // Wrap the existing saveState so every normal BudgetPro edit is synced.
+  const originalSaveState = window.saveState;
+  if (typeof originalSaveState === "function") {
+    window.saveState = function () {
+      const result = originalSaveState.apply(this, arguments);
+      scheduleCloudSave();
+      return result;
+    };
+  }
+
+  sb.auth.onAuthStateChange(async (event, session) => {
+    await updateAuthUI();
+    if (session?.user) {
+      await pullCloud();
+    }
+  });
+
+  window.BudgetProCloudSync = {
+    push: pushCloud,
+    pull: pullCloud,
+    schedulePush: scheduleCloudSave
+  };
+
+  window.addEventListener("load", async () => {
+    await updateAuthUI();
+    const user = await getUser();
+    if (user) await pullCloud();
+  });
+})();
+</script>
+
 </html>
