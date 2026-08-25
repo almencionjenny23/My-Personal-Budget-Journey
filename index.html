@@ -968,6 +968,12 @@ if ('serviceWorker' in navigator) {
                             </tbody>
                         </table>
                     </div>
+                    <div class="mt-4 flex justify-center">
+                        <button type="button" onclick="openDeletedTransactionsModal()" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm font-bold transition flex items-center gap-2">
+                            <i class="fa-solid fa-rotate-left"></i>
+                            Restore Deleted Transactions
+                        </button>
+                    </div>
                 </div>
             </div>
 
@@ -2246,6 +2252,7 @@ if ('serviceWorker' in navigator) {
                 '10': 0, '5': 0, '1': 0, '0.25': 0
             },
             accounts: JSON.parse(localStorage.getItem('bp_accounts')) || defaultAccounts,
+            deletedTransactions: JSON.parse(localStorage.getItem('bp_deletedTransactions') || '[]'),
             transactions: JSON.parse(localStorage.getItem('bp_transactions')) || [
                 { id: 't1', type: 'income', desc: 'Monthly Salary', amount: 50000, date: '2026-03-01', category: 'Salary & Wages', account: 'bdo', budget: 50000 },
                 { id: 't2', type: 'expense', desc: 'Grocery Shopping', amount: 4500, date: '2026-03-02', category: 'Food & Dining', account: 'gcash', budget: 5000 },
@@ -3912,6 +3919,62 @@ if ('serviceWorker' in navigator) {
             openModal('transactionModal');
         }
 
+        function openDeletedTransactionsModal() {
+            state.deletedTransactions = state.deletedTransactions || [];
+            const existing = document.getElementById('deletedTransactionsModal');
+            if(existing) existing.remove();
+            const rows = state.deletedTransactions.length ? state.deletedTransactions.map(txn => `
+                <div class="p-3 border border-slate-200 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div>
+                        <div class="font-bold text-sm text-slate-800">${escapeHtml(txn.desc || 'Transaction')}</div>
+                        <div class="text-xs text-slate-500">${escapeHtml(txn.type || '')} • ₱${formatMoney(Number(txn.amount) || 0)} • ${txn.date || ''}</div>
+                    </div>
+                    <button onclick="restoreDeletedTransaction('${txn.id}')" class="px-3 py-2 bg-brand text-white rounded-lg text-xs font-bold">
+                        <i class="fa-solid fa-rotate-left mr-1"></i> Restore
+                    </button>
+                </div>`).join('') : '<div class="text-center text-slate-500 py-8">No deleted transactions to restore.</div>';
+            document.body.insertAdjacentHTML('beforeend', `
+                <div id="deletedTransactionsModal" class="fixed inset-0 bg-slate-900/50 backdrop-blur-xs z-[60] flex items-center justify-center p-4">
+                    <div class="bg-white rounded-2xl max-w-lg w-full p-6 shadow-xl">
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="font-bold text-lg text-slate-900"><i class="fa-solid fa-trash-arrow-up text-brand mr-2"></i>Deleted Transactions</h3>
+                            <button onclick="document.getElementById('deletedTransactionsModal').remove()" class="text-slate-400"><i class="fa-solid fa-xmark text-lg"></i></button>
+                        </div>
+                        <div class="space-y-3 max-h-[60vh] overflow-y-auto">${rows}</div>
+                    </div>
+                </div>`);
+        }
+
+        function restoreDeletedTransaction(id) {
+            state.deletedTransactions = state.deletedTransactions || [];
+            const idx = state.deletedTransactions.findIndex(t => t.id === id);
+            if(idx === -1) return;
+            const txn = state.deletedTransactions[idx];
+            delete txn.deletedAt;
+            // Reapply the balance effect
+            if(txn.type === 'income') {
+                const acc = state.accounts.find(a => a.id === txn.account);
+                if(acc) acc.balance = parseFloat(acc.balance) + parseFloat(txn.amount);
+            } else if(txn.type === 'expense') {
+                const acc = state.accounts.find(a => a.id === txn.account);
+                if(acc) acc.balance = parseFloat(acc.balance) - parseFloat(txn.amount);
+            } else if(txn.type === 'transfer') {
+                const fromA = state.accounts.find(a => a.id === txn.fromAccount);
+                const toA = state.accounts.find(a => a.id === txn.toAccount);
+                if(fromA && toA) {
+                    fromA.balance = parseFloat(fromA.balance) - parseFloat(txn.amount);
+                    toA.balance = parseFloat(toA.balance) + parseFloat(txn.amount);
+                }
+            }
+            state.transactions.push(txn);
+            state.deletedTransactions.splice(idx, 1);
+            saveState();
+            renderAll();
+            const modal = document.getElementById('deletedTransactionsModal');
+            if(modal) modal.remove();
+            showToast('Transaction restored successfully!', 'success');
+        }
+
         function deleteTransaction(id) {
             const idx = state.transactions.findIndex(t => t.id === id);
             if(idx > -1) {
@@ -3931,10 +3994,13 @@ if ('serviceWorker' in navigator) {
                         toA.balance = parseFloat(toA.balance) - parseFloat(txn.amount);
                     }
                 }
+                // Keep a copy so it can be restored later
+                state.deletedTransactions = state.deletedTransactions || [];
+                state.deletedTransactions.unshift({ ...txn, deletedAt: new Date().toISOString() });
                 state.transactions.splice(idx, 1);
                 saveState();
                 renderAll();
-                showToast('Transaction deleted.', 'info');
+                showToast('Transaction deleted. You can restore it anytime.', 'info');
             }
         }
 
