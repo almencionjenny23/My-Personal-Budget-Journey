@@ -969,6 +969,29 @@ if ('serviceWorker' in navigator) {
                         </table>
                     </div>
                 </div>
+
+                <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
+                    <div class="flex items-center justify-between gap-3">
+                        <div>
+                            <h4 class="font-bold text-slate-900 text-sm flex items-center gap-2">
+                                <i class="fa-solid fa-trash-arrow-up text-brand"></i>
+                                Restore Deleted Transactions
+                            </h4>
+                            <p class="text-[11px] text-slate-500 mt-1">Deleted transactions are hidden until you click Restore.</p>
+                        </div>
+                        <button type="button" id="restore-deleted-toggle" onclick="toggleDeletedTransactions()" class="shrink-0 px-3.5 py-2 rounded-xl text-[11px] font-bold bg-brand text-white hover:opacity-90 transition shadow-xs">
+                            <i class="fa-solid fa-trash-arrow-up mr-1"></i> Restore
+                        </button>
+                    </div>
+                    <div id="deleted-transactions-panel" class="hidden mt-4">
+                        <div class="flex justify-end mb-3">
+                            <button type="button" onclick="clearDeletedTransactions()" class="px-3 py-2 rounded-xl text-[11px] font-bold text-rose-600 bg-rose-50 hover:bg-rose-100 transition">
+                                <i class="fa-solid fa-trash-can mr-1"></i> Clear All
+                            </button>
+                        </div>
+                        <div id="deleted-transactions-list" class="space-y-2"></div>
+                    </div>
+                </div>
             </div>
 
             <!-- SAVINGS TAB VIEW -->
@@ -1907,7 +1930,7 @@ if ('serviceWorker' in navigator) {
                 const snapshot = {};
                 for (let i = 0; i < localStorage.length; i++) {
                     const key = localStorage.key(i);
-                    if (key && key.startsWith('bp_') && key !== LAST_IMPORTED_KEY) {
+                    if (key && key.startsWith('bp_') && key !== LAST_IMPORTED_KEY && key !== 'bp_local_last_change') {
                         snapshot[key] = localStorage.getItem(key);
                     }
                 }
@@ -1928,10 +1951,15 @@ if ('serviceWorker' in navigator) {
                 const hash = getCurrentBudgetHash();
                 if (!hash) return false;
 
-                // Do not repeatedly restore the same (possibly old) URL snapshot.
-                // This is the main fix for edits disappearing after refresh.
+                // A normal refresh must preserve existing local edits. Only import
+                // the URL snapshot automatically when this browser has no budget
+                // data yet, or when the exact hash was not previously imported and
+                // there is no recorded local edit. Explicit hash changes still use
+                // force=true and are treated as intentional shared-link imports.
                 const lastImported = localStorage.getItem(LAST_IMPORTED_KEY);
-                if (!force && lastImported === hash) return false;
+                const hasLocalData = hasExistingBudgetData();
+                const hasLocalEdit = !!localStorage.getItem('bp_local_last_change');
+                if (!force && (lastImported === hash || (hasLocalData && hasLocalEdit))) return false;
 
                 try {
                     const encoded = hash.slice(('#' + HASH_KEY).length);
@@ -2251,6 +2279,7 @@ if ('serviceWorker' in navigator) {
                 { id: 't2', type: 'expense', desc: 'Grocery Shopping', amount: 4500, date: '2026-03-02', category: 'Food & Dining', account: 'gcash', budget: 5000 },
                 { id: 't3', type: 'expense', desc: 'Electric Bill', amount: 3200, date: '2026-03-05', category: 'Bills & Utilities', account: 'bdo', budget: 3000 }
             ],
+            deletedTransactions: JSON.parse(localStorage.getItem('bp_deletedTransactions') || '[]'),
             savings: JSON.parse(localStorage.getItem('bp_savings')) || [
                 { 
                     id: 's1', 
@@ -2307,6 +2336,8 @@ if ('serviceWorker' in navigator) {
         let chartExpense = null;
 
         function saveState() {
+            // Track the latest local edit so cloud sync never overwrites newer browser changes.
+            localStorage.setItem('bp_local_last_change', new Date().toISOString());
             if (!state.cashDenominations) {
                 state.cashDenominations = {};
                 CASH_DENOMINATIONS.forEach(d => state.cashDenominations[String(d.value)] = 0);
@@ -2325,6 +2356,7 @@ if ('serviceWorker' in navigator) {
             localStorage.setItem('bp_cashDenominations', JSON.stringify(state.cashDenominations));
             localStorage.setItem('bp_accounts', JSON.stringify(state.accounts));
             localStorage.setItem('bp_transactions', JSON.stringify(state.transactions));
+            localStorage.setItem('bp_deletedTransactions', JSON.stringify(state.deletedTransactions || []));
             localStorage.setItem('bp_savings', JSON.stringify(state.savings));
             localStorage.setItem('bp_debts', JSON.stringify(state.debts));
             localStorage.setItem('bp_borrowers', JSON.stringify(state.borrowers));
@@ -3301,6 +3333,74 @@ if ('serviceWorker' in navigator) {
             } else {
                 list.innerHTML = filtered.map(t => generateTransactionRowHTML(t, true)).join('');
             }
+
+            renderDeletedTransactions();
+        }
+
+        function toggleDeletedTransactions() {
+            const panel = document.getElementById('deleted-transactions-panel');
+            const button = document.getElementById('restore-deleted-toggle');
+            if (!panel || !button) return;
+
+            const willShow = panel.classList.contains('hidden');
+            panel.classList.toggle('hidden', !willShow);
+            button.innerHTML = willShow
+                ? '<i class="fa-solid fa-eye-slash mr-1"></i> Hide Deleted'
+                : '<i class="fa-solid fa-trash-arrow-up mr-1"></i> Restore';
+
+            if (willShow) renderDeletedTransactions();
+        }
+
+        function renderDeletedTransactions() {
+            const list = document.getElementById('deleted-transactions-list');
+            if (!list) return;
+
+            const deleted = (state.deletedTransactions || []).slice().sort((a, b) => {
+                return new Date(b.deletedAt || 0) - new Date(a.deletedAt || 0);
+            });
+
+            if (!deleted.length) {
+                list.innerHTML = `
+                    <div class="text-center py-5 rounded-xl border border-dashed border-slate-200 bg-slate-50">
+                        <i class="fa-solid fa-trash-can-arrow-up text-slate-300 text-xl mb-2"></i>
+                        <p class="text-xs font-semibold text-slate-400">No deleted transactions</p>
+                        <p class="text-[10px] text-slate-400 mt-1">When you delete a transaction, it will appear here.</p>
+                    </div>`;
+                return;
+            }
+
+            list.innerHTML = deleted.map(txn => {
+                const typeClass = txn.type === 'income'
+                    ? 'bg-emerald-50 text-emerald-600'
+                    : txn.type === 'expense'
+                        ? 'bg-rose-50 text-rose-600'
+                        : 'bg-slate-100 text-slate-600';
+
+                return `
+                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 rounded-xl border border-slate-100 bg-slate-50">
+                        <div class="min-w-0">
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <span class="capitalize text-[10px] font-bold px-2 py-1 rounded-md ${typeClass}">${escapeHtml(txn.type || '')}</span>
+                                <span class="font-bold text-xs text-slate-800 truncate">${escapeHtml(txn.desc || 'Untitled transaction')}</span>
+                                <span class="text-xs font-extrabold text-slate-700">${formatCurrency(txn.amount)}</span>
+                            </div>
+                            <div class="text-[10px] text-slate-400 mt-1">
+                                ${formatDate(txn.date)} • ${escapeHtml(txn.category || '-')} • Deleted ${txn.deletedAt ? formatDateTime(txn.deletedAt) : ''}
+                            </div>
+                        </div>
+                        <button type="button" onclick="restoreTransaction('${txn.id}')"
+                            class="shrink-0 px-3.5 py-2 rounded-xl bg-brand text-white hover:opacity-90 transition text-[11px] font-bold shadow-xs">
+                            <i class="fa-solid fa-trash-arrow-up mr-1"></i> Restore
+                        </button>
+                    </div>`;
+            }).join('');
+        }
+
+        function formatDateTime(dateStr) {
+            if (!dateStr) return '';
+            const d = new Date(dateStr);
+            if (isNaN(d.getTime())) return '';
+            return d.toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
         }
 
 
@@ -3916,6 +4016,7 @@ if ('serviceWorker' in navigator) {
             const idx = state.transactions.findIndex(t => t.id === id);
             if(idx > -1) {
                 const txn = state.transactions[idx];
+
                 // Reverse balance effect
                 if(txn.type === 'income') {
                     const acc = state.accounts.find(a => a.id === txn.account);
@@ -3931,12 +4032,73 @@ if ('serviceWorker' in navigator) {
                         toA.balance = parseFloat(toA.balance) - parseFloat(txn.amount);
                     }
                 }
+
+                // Keep a copy in Recently Deleted so it can be restored later.
+                if (!state.deletedTransactions) state.deletedTransactions = [];
+                state.deletedTransactions.unshift({
+                    ...txn,
+                    deletedAt: new Date().toISOString()
+                });
+
+                // Keep the restore area tidy and prevent an unlimited list.
+                state.deletedTransactions = state.deletedTransactions.slice(0, 20);
+
                 state.transactions.splice(idx, 1);
                 saveState();
                 renderAll();
-                showToast('Transaction deleted.', 'info');
+                showToast('Transaction deleted. You can restore it below.', 'info');
             }
         }
+
+        function restoreTransaction(id) {
+            if (!state.deletedTransactions) state.deletedTransactions = [];
+
+            const idx = state.deletedTransactions.findIndex(t => t.id === id);
+            if (idx === -1) {
+                showToast('Deleted transaction not found.', 'error');
+                return;
+            }
+
+            const txn = {...state.deletedTransactions[idx]};
+            delete txn.deletedAt;
+
+            // Avoid duplicate IDs if the transaction already exists for any reason.
+            if (state.transactions.some(t => t.id === txn.id)) {
+                txn.id = 't_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+            }
+
+            state.transactions.push(txn);
+
+            // Re-apply the transaction's account effect.
+            if (txn.type === 'income') {
+                const acc = state.accounts.find(a => a.id === txn.account);
+                if (acc) acc.balance = (parseFloat(acc.balance) || 0) + (parseFloat(txn.amount) || 0);
+            } else if (txn.type === 'expense') {
+                const acc = state.accounts.find(a => a.id === txn.account);
+                if (acc) acc.balance = (parseFloat(acc.balance) || 0) - (parseFloat(txn.amount) || 0);
+            } else if (txn.type === 'transfer') {
+                const fromA = state.accounts.find(a => a.id === txn.fromAccount);
+                const toA = state.accounts.find(a => a.id === txn.toAccount);
+                if (fromA) fromA.balance = (parseFloat(fromA.balance) || 0) - (parseFloat(txn.amount) || 0);
+                if (toA) toA.balance = (parseFloat(toA.balance) || 0) + (parseFloat(txn.amount) || 0);
+            }
+
+            state.deletedTransactions.splice(idx, 1);
+            saveState();
+            renderAll();
+            showToast('Transaction restored successfully! ♻️', 'success');
+        }
+
+        function clearDeletedTransactions() {
+            if (!state.deletedTransactions || !state.deletedTransactions.length) return;
+            if (!confirm('Permanently remove all deleted transactions? This cannot be undone.')) return;
+
+            state.deletedTransactions = [];
+            saveState();
+            renderTransactions();
+            showToast('Recently deleted transactions cleared.', 'info');
+        }
+
 
         function deleteEntity(type, id) {
             if(confirm('Are you sure you want to delete this record?')) {
@@ -4651,6 +4813,8 @@ if ('serviceWorker' in navigator) {
       const k = localStorage.key(i);
       if (k && k.startsWith("bp_") && ![
         "bp_cloud_last_sync",
+        "bp_local_last_change",
+        "bp_lastImportedHash",
         "bp_device_id",
         "bp_supabase_config"
       ].includes(k)) {
@@ -4733,11 +4897,18 @@ if ('serviceWorker' in navigator) {
     }
 
     const remoteTime = new Date(data.updated_at || 0).getTime();
-    const localTime = new Date(localStorage.getItem("bp_cloud_last_sync") || 0).getTime();
+    // Compare the cloud copy with the user's MOST RECENT local edit, not merely
+    // the last time this browser synced. Otherwise an older cloud copy can erase
+    // changes made on this device after the previous sync.
+    const localChangeTime = new Date(
+      localStorage.getItem("bp_local_last_change") ||
+      localStorage.getItem("bp_cloud_last_sync") || 0
+    ).getTime();
 
-    if (remoteTime >= localTime) {
+    if (remoteTime > localChangeTime) {
       restoreState(data.data);
       localStorage.setItem("bp_cloud_last_sync", data.updated_at);
+      localStorage.setItem("bp_local_last_change", data.updated_at);
       setStatus("✓ Cloud data loaded");
       if (typeof renderAll === "function") renderAll();
       const savedTab = ["dashboard","transactions","savings","debt","borrowers"].includes(state.activeTab)
@@ -4761,11 +4932,12 @@ if ('serviceWorker' in navigator) {
         if (!row || !row.data) return;
 
         const remoteTime = new Date(row.updated_at || 0).getTime();
-        const localTime = new Date(localStorage.getItem("bp_cloud_last_sync") || 0).getTime();
+        const localChangeTime = new Date(localStorage.getItem("bp_local_last_change") || localStorage.getItem("bp_cloud_last_sync") || 0).getTime();
 
-        if (remoteTime > localTime) {
+        if (remoteTime > localChangeTime) {
           restoreState(row.data);
           localStorage.setItem("bp_cloud_last_sync", row.updated_at);
+          localStorage.setItem("bp_local_last_change", row.updated_at);
           setStatus("✓ Updated from another device");
           if (typeof renderAll === "function") renderAll();
           const savedTab = ["dashboard","transactions","savings","debt","borrowers"].includes(state.activeTab)
