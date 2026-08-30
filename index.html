@@ -585,6 +585,22 @@ if ('serviceWorker' in navigator) {
     <div id="bp-cloud-message" style="font-size:11px;margin-top:10px;line-height:1.4;"></div>
   </div>
 </div>
+                <div id="bp-backup-panel" style="position:relative;z-index:99998;font-family:inherit;display:inline-flex;align-items:center;">
+                  <button id="bp-backup-button" type="button" title="Backup and restore all BudgetPro data"
+                    style="border:0;border-radius:999px;padding:11px 16px;background:#e0e7ff;color:#3730a3;font-weight:800;box-shadow:0 8px 24px rgba(0,0,0,.10);cursor:pointer;">
+                    💾 Backup &amp; Restore
+                  </button>
+                  <div id="bp-backup-modal" style="display:none;position:absolute;right:0;top:calc(100% + 10px);width:340px;background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.2);color:#334155;">
+                    <div style="font-weight:900;font-size:17px;margin-bottom:4px;">💾 Backup &amp; Restore</div>
+                    <div style="font-size:11px;color:#64748b;line-height:1.5;margin-bottom:14px;">Save a complete copy of your BudgetPro data to a file. You can use that file to restore your transactions, accounts, savings, debts, borrowers, budgets, and settings.</div>
+                    <button id="bp-create-backup" type="button" style="width:100%;border:0;border-radius:11px;padding:11px;background:#4f46e5;color:#fff;font-weight:800;cursor:pointer;margin-bottom:8px;">⬇️ Create Backup File</button>
+                    <button id="bp-restore-backup" type="button" style="width:100%;border:0;border-radius:11px;padding:11px;background:#ecfdf5;color:#047857;font-weight:800;cursor:pointer;margin-bottom:8px;">♻️ Restore Backup File</button>
+                    <button id="bp-history-toggle" type="button" style="width:100%;border:1px solid #cbd5e1;border-radius:11px;padding:10px;background:#f8fafc;color:#334155;font-weight:800;cursor:pointer;">🕘 Automatic Backup History (10)</button>
+                    <div id="bp-backup-history" style="display:none;margin-top:10px;max-height:230px;overflow:auto;"></div>
+                    <input id="bp-backup-file-input" type="file" accept=".json,application/json" style="display:none;">
+                    <div id="bp-backup-message" style="font-size:11px;margin-top:10px;line-height:1.4;"></div>
+                  </div>
+                </div>
                 <button onclick="copyBudgetLink()" title="Copy a shareable link containing this entire budget" class="px-3 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-xl text-xs font-bold transition flex items-center space-x-2 border border-emerald-200">
                     <i class="fa-solid fa-link"></i>
                     <span class="hidden sm:inline">Share Budget</span>
@@ -4419,15 +4435,21 @@ if ('serviceWorker' in navigator) {
             const today = new Date();
             const items = [];
 
+            // For debts, reminders follow the actual unpaid installment in the payment schedule.
+            // This prevents a payment that was already recorded from continuing to remind.
             (state.debts || []).forEach(d => {
                 const remaining = Math.max(0, (parseFloat(d.total) || 0) - (parseFloat(d.paid) || 0));
                 if(remaining <= 0) return;
-                const due = getNextMonthlyDueDate(d.dueDate, today);
-                if(!due) return;
+
+                const nextEntry = getDebtNextUnpaidScheduleEntry(d);
+                if(!nextEntry) return;
+
                 items.push({
                     type: 'debt', id: d.id, label: 'Debt', name: d.name || 'Debt',
-                    loanType: d.loanType || '', dueDate: due,
-                    amount: parseFloat(d.monthly) || ((parseFloat(d.total) || 0) / Math.max(1, parseInt(d.months) || 1))
+                    loanType: d.loanType || '', dueDate: nextEntry.date,
+                    amount: Math.max(0, parseFloat(nextEntry.amount) || 0),
+                    cutoff: nextEntry.cutoff,
+                    installmentIndex: nextEntry.index
                 });
             });
 
@@ -4606,89 +4628,61 @@ if ('serviceWorker' in navigator) {
         let editableDebtScheduleId = null;
 
         function getDebtScheduleEntries(debt) {
-            const paymentsPerMonth = getDebtPaymentCount(debt);
-            const durationMonths = Math.max(1, parseInt(debt?.months) || 1);
-            const start = new Date(debt?.dueDate || new Date());
-
-            const cutoff1 = Math.min(31, Math.max(1, parseInt(debt?.cutoff1) || 15));
-            const cutoff2 = Math.min(31, Math.max(1, parseInt(debt?.cutoff2) || 30));
-            const monthly = parseFloat(debt?.monthly) || ((parseFloat(debt?.total) || 0) / durationMonths);
-            const defaultPerPayment = paymentsPerMonth === 2 ? monthly / 2 : monthly;
-            const saved = Array.isArray(debt?.paymentSchedule) ? debt.paymentSchedule : [];
+            if (!debt || !debt.dueDate) return [];
+            const months = Math.max(1, parseInt(debt.months) || 1);
+            const count = Math.max(1, parseInt(debt.paymentsPerMonth) || 1);
+            const totalInstallments = months * count;
+            const monthly = parseFloat(debt.monthly) || ((parseFloat(debt.total) || 0) / months);
+            const saved = Array.isArray(debt.paymentSchedule) ? debt.paymentSchedule : [];
+            const fallbackAmount = count === 2 ? monthly / 2 : monthly;
+            const start = new Date(debt.dueDate + 'T00:00:00');
+            const cutoff1 = Math.max(1, parseInt(debt.cutoff1) || 15);
+            const cutoff2 = Math.max(1, parseInt(debt.cutoff2) || 30);
             const entries = [];
 
-            // IMPORTANT: the First Due Date is the actual starting date.
-            // If the user chooses June 30, the schedule MUST start on June 30,
-            // not June 15. After that, continue with the next configured cut-off.
-            if (paymentsPerMonth === 2) {
-                const totalEntries = durationMonths * 2;
-                let cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
-
-                for (let i = 0; i < totalEntries; i++) {
-                    let date;
-                    let label;
-
-                    if (i === 0) {
-                        date = new Date(cursor);
-                        if (date.getDate() === cutoff1) label = '1st Cut-off';
-                        else if (date.getDate() === cutoff2) label = '2nd Cut-off';
-                        else label = 'First Payment';
-                    } else {
-                        // Find the next configured cut-off strictly after the previous payment.
-                        const prev = entries[i - 1].date;
-                        const candidates = [];
-                        for (let m = 0; m <= 2; m++) {
-                            const y = prev.getFullYear();
-                            const mo = prev.getMonth() + m;
-                            const lastDay = new Date(y, mo + 1, 0).getDate();
-                            const d1 = new Date(y, mo, Math.min(cutoff1, lastDay));
-                            const d2 = new Date(y, mo, Math.min(cutoff2, lastDay));
-                            candidates.push({date:d1, label:'1st Cut-off'});
-                            candidates.push({date:d2, label:'2nd Cut-off'});
-                        }
-                        candidates.sort((a,b) => a.date - b.date);
-                        const next = candidates.find(c => c.date > prev);
-                        date = next ? next.date : new Date(prev.getFullYear(), prev.getMonth() + 1, cutoff1);
-                        label = next ? next.label : '1st Cut-off';
-                    }
-
-                    let savedAmount = parseFloat(saved[i]);
-                    // Backward compatibility with an older 2-payment schedule that
-                    // stored only one amount per month.
-                    if (!Number.isFinite(savedAmount) && saved.length === durationMonths) {
-                        const oldMonthly = parseFloat(saved[Math.floor(i / 2)]);
-                        if (Number.isFinite(oldMonthly)) savedAmount = oldMonthly / 2;
-                    }
-
-                    entries.push({
-                        index: i,
-                        monthIndex: Math.floor(i / 2),
-                        cutoffIndex: label === '1st Cut-off' ? 0 : 1,
-                        date,
-                        cutoffDay: date.getDate(),
-                        amount: Number.isFinite(savedAmount) ? Math.max(0, savedAmount) : defaultPerPayment,
-                        label
-                    });
-                }
-            } else {
-                const savedAmount = saved;
-                for (let i = 0; i < durationMonths; i++) {
-                    const date = new Date(start);
-                    date.setMonth(date.getMonth() + i);
-                    const amount = parseFloat(savedAmount[i]);
-                    entries.push({
-                        index: i,
-                        monthIndex: i,
-                        cutoffIndex: 0,
-                        date,
-                        cutoffDay: date.getDate(),
-                        amount: Number.isFinite(amount) ? Math.max(0, amount) : monthly,
-                        label: 'Payment'
-                    });
-                }
+            function dateFor(y, m, day) {
+                const last = new Date(y, m + 1, 0).getDate();
+                return new Date(y, m, Math.min(day, last));
             }
 
+            if (count === 1) {
+                for (let i = 0; i < totalInstallments; i++) {
+                    const d = new Date(start.getFullYear(), start.getMonth() + i, Math.min(start.getDate(), new Date(start.getFullYear(), start.getMonth() + i + 1, 0).getDate()));
+                    entries.push({ index:i, date:d, amount:Number.isFinite(parseFloat(saved[i])) ? Math.max(0, parseFloat(saved[i])) : fallbackAmount, cutoff:null });
+                }
+            } else {
+                // Start from the exact First Due Date. Never move the first payment backward.
+                // After that, alternate between cutoff 1 and cutoff 2 in chronological order.
+                let cursor = new Date(start);
+                for (let i = 0; i < totalInstallments; i++) {
+                    let candidateDates = [];
+                    for (let m = 0; m < 3 && candidateDates.length < 6; m++) {
+                        const y = start.getFullYear();
+                        const mo = start.getMonth() + m;
+                        candidateDates.push({date:dateFor(y,mo,cutoff1),cutoff:1});
+                        candidateDates.push({date:dateFor(y,mo,cutoff2),cutoff:2});
+                    }
+                    candidateDates = candidateDates.filter(x => x.date >= cursor).sort((a,b) => a.date - b.date);
+                    const chosen = candidateDates[0];
+                    if (!chosen) break;
+                    entries.push({ index:i, date:chosen.date, amount:Number.isFinite(parseFloat(saved[i])) ? Math.max(0, parseFloat(saved[i])) : fallbackAmount, cutoff:chosen.cutoff });
+                    cursor = new Date(chosen.date.getFullYear(), chosen.date.getMonth(), chosen.date.getDate() + 1);
+                }
+            }
             return entries;
+        }
+
+        function getDebtNextUnpaidScheduleEntry(debt) {
+            const entries = getDebtScheduleEntries(debt);
+            const totalPaid = (debt.history || []).reduce((sum,h) => sum + (parseFloat(h.amount) || 0), 0);
+            let cumulative = 0;
+            for (const entry of entries) {
+                const amount = Math.max(0, parseFloat(entry.amount) || 0);
+                const paidForEntry = Math.max(0, Math.min(amount, totalPaid - cumulative));
+                if (paidForEntry < amount - 0.005) return { ...entry, paid:paidForEntry };
+                cumulative += amount;
+            }
+            return null;
         }
 
         function openScheduleModal(type, id) {
@@ -4698,116 +4692,54 @@ if ('serviceWorker' in navigator) {
             const saveButton = document.getElementById('schedule-save-button');
             const note = document.getElementById('schedule-edit-note');
 
-            let item, entries, totalPaid = 0;
-
+            let item, entries;
             if(type === 'debt') {
                 item = state.debts.find(d => d.id === id);
                 if(!item) return;
-
                 title.innerText = `Payment Schedule: ${item.name}`;
-                const count = getDebtPaymentCount(item);
-                subtitle.innerText = count === 2
-                    ? `2 payments per month • ${item.cutoff1 || 15}th & ${item.cutoff2 || 30}th • Edit each amount`
-                    : 'Edit each scheduled payment amount. Changes are saved to this debt.';
-
+                subtitle.innerText = 'Edit each payment amount and use the exact First Due Date as the starting payment.';
                 editableDebtScheduleId = item.id;
-                saveButton.classList.remove('hidden');
-                note.innerText = count === 2
-                    ? 'Each month has two editable payments: 1st cut-off and 2nd cut-off.'
-                    : 'You can change each payment amount independently.';
-
+                if(saveButton) saveButton.classList.remove('hidden');
+                if(note) note.innerText = 'Each debt payment amount is editable.';
                 entries = getDebtScheduleEntries(item);
-                totalPaid = (Array.isArray(item.history) ? item.history : [])
-                    .reduce((sum, h) => sum + (parseFloat(h.amount) || 0), 0);
             } else {
                 item = state.borrowers.find(b => b.id === id);
                 if(!item) return;
-
                 title.innerText = `Collection Schedule: ${item.name}`;
                 subtitle.innerText = 'Breakdown of due dates and monthly collections across loan duration';
                 editableDebtScheduleId = null;
-                saveButton.classList.add('hidden');
-                note.innerText = 'Collection schedule';
-
-                const monthly = parseFloat(item.monthly) ||
-                    (parseFloat(item.amount) / Math.max(1, parseInt(item.months) || 1));
-                const duration = Math.max(1, parseInt(item.months) || 1);
-                const start = new Date(item.dueDate);
-
-                entries = Array.from({length: duration}, (_, i) => {
-                    const d = new Date(start);
-                    d.setMonth(d.getMonth() + i);
-                    return { index:i, monthIndex:i, cutoffIndex:0, date:d, cutoffDay:d.getDate(), amount:monthly, label:'Collection' };
-                });
-
-                totalPaid = (Array.isArray(item.history) ? item.history : [])
-                    .reduce((sum, h) => sum + (parseFloat(h.amount) || 0), 0);
+                if(saveButton) saveButton.classList.add('hidden');
+                if(note) note.innerText = 'Collection schedule';
+                const monthly = parseFloat(item.monthly) || ((parseFloat(item.amount) || 0) / Math.max(1, parseInt(item.months) || 1));
+                const start = new Date(item.dueDate + 'T00:00:00');
+                const months = Math.max(1, parseInt(item.months) || 1);
+                entries = Array.from({length:months}, (_,i) => { const d=new Date(start.getFullYear(),start.getMonth()+i,start.getDate()); return {index:i,date:d,amount:monthly,cutoff:null}; });
             }
 
-            let scheduleHTML = `
-                <div class="mb-3 flex flex-wrap gap-2 text-[10px] font-bold">
-                    <span class="px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700">✓ Paid / Collected</span>
-                    <span class="px-2.5 py-1 rounded-full bg-amber-100 text-amber-700">◐ Partial</span>
-                    <span class="px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">○ Due</span>
-                </div>
-            `;
-
-            let cumulativeDue = 0;
+            const totalPaid = (item.history || []).reduce((sum,h) => sum + (parseFloat(h.amount) || 0), 0);
+            let cumulative = 0;
+            let scheduleHTML = `<div class="mb-3 flex flex-wrap gap-2 text-[10px] font-bold">
+                <span class="px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700">✓ Paid / Collected</span>
+                <span class="px-2.5 py-1 rounded-full bg-amber-100 text-amber-700">◐ Partial</span>
+                <span class="px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">○ Due</span>
+            </div>`;
 
             entries.forEach((entry, i) => {
-                const scheduledAmount = Math.max(0, parseFloat(entry.amount) || 0);
-                const beforeInstallment = cumulativeDue;
-                cumulativeDue += scheduledAmount;
-
-                const paidForThisInstallment = Math.max(
-                    0,
-                    Math.min(scheduledAmount, totalPaid - beforeInstallment)
-                );
-
-                let statusClass = 'schedule-due';
-                let statusText = 'DUE';
-                let icon = '<i class="fa-regular fa-circle"></i>';
-
-                if (scheduledAmount > 0 && paidForThisInstallment >= scheduledAmount - 0.005) {
-                    statusClass = 'schedule-paid';
-                    statusText = type === 'debt' ? 'PAID' : 'COLLECTED';
-                    icon = '<i class="fa-solid fa-circle-check"></i>';
-                } else if (paidForThisInstallment > 0) {
-                    statusClass = 'schedule-partial';
-                    statusText = 'PARTIAL';
-                    icon = '<i class="fa-solid fa-hourglass-half"></i>';
-                }
-
+                const amount = Math.max(0, parseFloat(entry.amount) || 0);
+                const paidForThis = Math.max(0, Math.min(amount, totalPaid - cumulative));
+                let statusClass='schedule-due', statusText='DUE', icon='<i class="fa-regular fa-circle"></i>';
+                if(paidForThis >= amount - 0.005) { statusClass='schedule-paid'; statusText=type==='debt'?'PAID':'COLLECTED'; icon='<i class="fa-solid fa-circle-check"></i>'; }
+                else if(paidForThis > 0) { statusClass='schedule-partial'; statusText='PARTIAL'; icon='<i class="fa-solid fa-hourglass-half"></i>'; }
+                const cutoffLabel = entry.cutoff ? ` • ${entry.cutoff === 1 ? '1st Cut-off' : '2nd Cut-off'}` : '';
                 const amountHTML = type === 'debt'
-                    ? `<div class="flex items-center gap-1">
-                            <span class="text-[10px] font-bold text-slate-400">₱</span>
-                            <input type="number" step="0.01" min="0" value="${scheduledAmount.toFixed(2)}"
-                                data-schedule-index="${entry.index}"
-                                class="schedule-amount-input w-32 px-2.5 py-2 bg-white border border-slate-200 rounded-lg text-right font-bold text-sm focus:outline-none focus:ring-2 focus:ring-brand/30"
-                                aria-label="${entry.label} ${i + 1} amount">
-                       </div>`
-                    : `<span class="block font-bold text-sm">${formatCurrency(scheduledAmount)}</span>`;
-
-                const cutoffBadge = type === 'debt' && getDebtPaymentCount(item) === 2
-                    ? `<span class="inline-flex mt-1 px-2 py-0.5 rounded-full bg-white/70 border border-current/10 text-[9px] font-bold">${entry.label}</span>`
-                    : '';
-
-                scheduleHTML += `
-                    <div class="schedule-row ${statusClass} p-3 rounded-xl border flex justify-between items-center mb-2">
-                        <div class="flex items-center gap-3 min-w-0">
-                            <div class="schedule-icon">${icon}</div>
-                            <div class="flex flex-col min-w-0">
-                                <span class="text-xs font-bold">${type === 'debt' ? `Payment ${i + 1}` : `Collection ${i + 1}`}</span>
-                                <span class="schedule-date text-[10px]">${entry.date.toLocaleDateString('en-US', {month:'long', day:'numeric', year:'numeric'})}</span>
-                                ${cutoffBadge}
-                            </div>
-                        </div>
-                        <div class="text-right shrink-0">
-                            ${amountHTML}
-                            <span class="text-[9px] font-extrabold tracking-wide">${statusText}</span>
-                        </div>
-                    </div>
-                `;
+                    ? `<input type="number" step="0.01" min="0" value="${amount.toFixed(2)}" data-schedule-index="${i}" class="schedule-amount-input w-32 px-2.5 py-2 bg-white border border-slate-200 rounded-lg text-right font-bold text-sm focus:outline-none focus:ring-2 focus:ring-brand/30" aria-label="Payment ${i+1} amount">`
+                    : `<span class="block font-bold text-sm">${formatCurrency(amount)}</span>`;
+                scheduleHTML += `<div class="schedule-row ${statusClass} p-3 rounded-xl border flex justify-between items-center mb-2">
+                    <div class="flex items-center gap-3"><div class="schedule-icon">${icon}</div><div class="flex flex-col">
+                        <span class="text-xs font-bold">${type==='debt'?'Payment':'Collection'} ${i+1}${cutoffLabel}</span>
+                        <span class="schedule-date text-[10px]">${entry.date.toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'})}</span>
+                    </div></div><div class="text-right">${amountHTML}<span class="text-[9px] font-extrabold tracking-wide">${statusText}</span></div></div>`;
+                cumulative += amount;
             });
 
             body.innerHTML = scheduleHTML;
@@ -4816,36 +4748,20 @@ if ('serviceWorker' in navigator) {
 
         function saveEditableDebtSchedule() {
             if(!editableDebtScheduleId) return;
-
             const debt = state.debts.find(d => d.id === editableDebtScheduleId);
             if(!debt) return;
-
             const inputs = Array.from(document.querySelectorAll('#schedule-modal-body .schedule-amount-input'));
             if(!inputs.length) return;
-
-            const count = getDebtPaymentCount(debt);
-            const durationMonths = Math.max(1, parseInt(debt.months) || 1);
-            const amounts = inputs.map(input => Math.max(0, parseFloat(input.value) || 0));
-
-            debt.paymentSchedule = amounts;
-
-            // `monthly` means the TOTAL scheduled amount for one month.
-            // With 2 cut-offs, it is the sum of the 1st + 2nd cut-off amounts.
-            if(count === 2) {
-                let monthlyTotal = 0;
-                for(let i = 0; i < durationMonths; i++) {
-                    monthlyTotal += (amounts[i * 2] || 0) + (amounts[i * 2 + 1] || 0);
-                }
-                debt.monthly = monthlyTotal / durationMonths;
-            } else {
-                debt.monthly = amounts.reduce((sum, amount) => sum + amount, 0) / amounts.length;
-            }
-
+            debt.paymentSchedule = inputs.map(input => Math.max(0, parseFloat(input.value) || 0));
+            const totalSchedule = debt.paymentSchedule.reduce((s,a)=>s+a,0);
+            const months = Math.max(1, parseInt(debt.months)||1);
+            debt.monthly = totalSchedule / months;
             saveState();
             renderDebt();
             renderDashboard();
+            renderDashboardDueReminders();
+            renderRemindersBanner();
             showToast('Debt payment schedule amounts saved!', 'success');
-
             openScheduleModal('debt', debt.id);
         }
 
@@ -4941,6 +4857,236 @@ if ('serviceWorker' in navigator) {
 
 </body>
 
+
+<script>
+(function () {
+  const panel = document.getElementById('bp-backup-panel');
+  const button = document.getElementById('bp-backup-button');
+  const modal = document.getElementById('bp-backup-modal');
+  const createBtn = document.getElementById('bp-create-backup');
+  const restoreBtn = document.getElementById('bp-restore-backup');
+  const historyToggle = document.getElementById('bp-history-toggle');
+  const historyBox = document.getElementById('bp-backup-history');
+  const fileInput = document.getElementById('bp-backup-file-input');
+  const message = document.getElementById('bp-backup-message');
+  if (!panel || !button || !modal || !createBtn || !restoreBtn || !fileInput) return;
+
+  const INTERNAL_KEYS = new Set([
+    'bp_cloud_last_sync', 'bp_device_id', 'bp_supabase_config',
+    'bp_lastImportedHash'
+  ]);
+
+  function setMessage(text, good) {
+    if (!message) return;
+    message.textContent = text || '';
+    message.style.color = good ? '#059669' : '#dc2626';
+  }
+
+  function collectBackupData() {
+    const data = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith('bp_') && !INTERNAL_KEYS.has(key)) {
+        data[key] = localStorage.getItem(key);
+      }
+    }
+    return data;
+  }
+
+  const AUTO_HISTORY_KEY = 'bp_auto_backup_history';
+  const AUTO_HISTORY_LIMIT = 10;
+  let autoBackupTimer = null;
+  let lastAutoSnapshot = '';
+
+  function getAutoHistory() {
+    try {
+      const raw = localStorage.getItem(AUTO_HISTORY_KEY);
+      const list = raw ? JSON.parse(raw) : [];
+      return Array.isArray(list) ? list : [];
+    } catch (e) { return []; }
+  }
+
+  function saveAutoHistory(list) {
+    localStorage.setItem(AUTO_HISTORY_KEY, JSON.stringify(list.slice(0, AUTO_HISTORY_LIMIT)));
+  }
+
+  function makeSnapshot() {
+    return { app:'BudgetPro', backupVersion:2, createdAt:new Date().toISOString(), data:collectBackupData() };
+  }
+
+  function snapshotSignature(data) {
+    try { return JSON.stringify(data); } catch (e) { return String(Date.now()); }
+  }
+
+  function createAutomaticBackup() {
+    try {
+      const backup = makeSnapshot();
+      const sig = snapshotSignature(backup.data);
+      if (sig === lastAutoSnapshot) return;
+      lastAutoSnapshot = sig;
+      const history = getAutoHistory();
+      history.unshift(backup);
+      saveAutoHistory(history);
+      renderAutoHistory();
+    } catch (e) { console.warn('BudgetPro automatic backup error:', e); }
+  }
+
+  function scheduleAutomaticBackup() {
+    clearTimeout(autoBackupTimer);
+    autoBackupTimer = setTimeout(createAutomaticBackup, 800);
+  }
+
+  function downloadAutoBackup(index) {
+    const history = getAutoHistory();
+    const backup = history[index];
+    if (!backup) return;
+    const blob = new Blob([JSON.stringify(backup, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date(backup.createdAt).toISOString().replace(/[:.]/g,'-');
+    a.href=url; a.download=`BudgetPro_AutoBackup_${stamp}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }
+
+  function restoreAutomaticBackup(index) {
+    const history = getAutoHistory();
+    const backup = history[index];
+    if (!backup) return;
+    restoreBackupObject(backup);
+    setMessage('Automatic backup restored. Reloading BudgetPro…', true);
+    setTimeout(()=>window.location.reload(),600);
+  }
+
+  function renderAutoHistory() {
+    if (!historyBox) return;
+    const history = getAutoHistory();
+    if (!history.length) {
+      historyBox.innerHTML='<div style="font-size:11px;color:#64748b;padding:8px 2px;">No automatic backups yet. They are created after your changes.</div>';
+      return;
+    }
+    historyBox.innerHTML = history.map((b,i)=>{
+      const d=new Date(b.createdAt);
+      const label=Number.isNaN(d.getTime()) ? b.createdAt : d.toLocaleString();
+      return `<div style="border:1px solid #e2e8f0;border-radius:10px;padding:9px;margin-bottom:7px;background:#fff;">
+        <div style="font-size:11px;font-weight:800;color:#334155;">Version ${history.length-i} · ${label}</div>
+        <div style="display:flex;gap:6px;margin-top:7px;">
+          <button type="button" data-auto-download="${i}" style="flex:1;border:0;border-radius:8px;padding:7px;background:#eef2ff;color:#3730a3;font-size:10px;font-weight:800;cursor:pointer;">⬇️ Save</button>
+          <button type="button" data-auto-restore="${i}" style="flex:1;border:0;border-radius:8px;padding:7px;background:#ecfdf5;color:#047857;font-size:10px;font-weight:800;cursor:pointer;">♻️ Restore</button>
+        </div></div>`;
+    }).join('');
+  }
+
+  function createBackup() {
+    try {
+      const backup = makeSnapshot();
+      const json = JSON.stringify(backup, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      a.href = url;
+      a.download = `BudgetPro_Backup_${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      localStorage.setItem('bp_last_backup_at', backup.createdAt);
+      setMessage('Backup created successfully. Keep this file somewhere safe.', true);
+    } catch (error) {
+      console.error('BudgetPro backup error:', error);
+      setMessage('Unable to create the backup file.', false);
+    }
+  }
+
+  function restoreBackupObject(backup) {
+    if (!backup || backup.app !== 'BudgetPro' || !backup.data || typeof backup.data !== 'object') {
+      throw new Error('This is not a valid BudgetPro backup file.');
+    }
+
+    const keys = Object.keys(backup.data).filter(k => k.startsWith('bp_') && !INTERNAL_KEYS.has(k));
+    if (!keys.length) throw new Error('The backup does not contain BudgetPro data.');
+
+    if (!confirm('Restore this BudgetPro backup? Your current data on this device will be replaced by the backup.')) return false;
+
+    // Keep an emergency copy of the current state before replacing it.
+    try {
+      const emergency = {
+        app: 'BudgetPro', backupVersion: 1,
+        createdAt: new Date().toISOString(),
+        data: collectBackupData()
+      };
+      localStorage.setItem('bp_emergency_before_restore', JSON.stringify(emergency));
+    } catch (e) {
+      console.warn('Could not save emergency restore point.', e);
+    }
+
+    Object.entries(backup.data).forEach(([key, value]) => {
+      if (key.startsWith('bp_') && !INTERNAL_KEYS.has(key)) {
+        localStorage.setItem(key, String(value));
+      }
+    });
+
+    // Mark this as a fresh local edit so cloud sync does not immediately replace it.
+    localStorage.setItem('bp_local_last_change', new Date().toISOString());
+    localStorage.removeItem('bp_cloud_last_sync');
+    localStorage.removeItem('bp_lastImportedHash');
+
+    // Rebuild the shareable URL from the restored local data before reloading.
+    if (window.__bpUrlSync && typeof window.__bpUrlSync.sync === 'function') {
+      window.__bpUrlSync.sync();
+    }
+    return true;
+  }
+
+  button.addEventListener('click', (e) => {
+    e.stopPropagation();
+    modal.style.display = modal.style.display === 'none' ? 'block' : 'none';
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!panel.contains(e.target)) modal.style.display = 'none';
+  });
+
+  createBtn.addEventListener('click', createBackup);
+  restoreBtn.addEventListener('click', () => fileInput.click());
+  if (historyToggle) {
+    historyToggle.addEventListener('click', () => {
+      const open = historyBox.style.display !== 'none';
+      historyBox.style.display = open ? 'none' : 'block';
+      if (!open) renderAutoHistory();
+    });
+  }
+  if (historyBox) {
+    historyBox.addEventListener('click', (e) => {
+      const dl = e.target.closest('[data-auto-download]');
+      const rs = e.target.closest('[data-auto-restore]');
+      if (dl) downloadAutoBackup(Number(dl.dataset.autoDownload));
+      if (rs) restoreAutomaticBackup(Number(rs.dataset.autoRestore));
+    });
+  }
+  window.__bpScheduleAutomaticBackup = scheduleAutomaticBackup;
+  renderAutoHistory();
+
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const backup = JSON.parse(text);
+      const restored = restoreBackupObject(backup);
+      if (!restored) return;
+      setMessage('Backup restored. Reloading BudgetPro…', true);
+      setTimeout(() => window.location.reload(), 600);
+    } catch (error) {
+      console.error('BudgetPro restore error:', error);
+      setMessage(error.message || 'Unable to restore this backup.', false);
+    } finally {
+      fileInput.value = '';
+    }
+  });
+})();
+</script>
 
 <script>
 (function () {
@@ -5175,6 +5321,7 @@ if ('serviceWorker' in navigator) {
     window.saveState = function () {
       const result = originalSaveState.apply(this, arguments);
       scheduleCloudSave();
+      if (window.__bpScheduleAutomaticBackup) window.__bpScheduleAutomaticBackup();
       return result;
     };
   }
